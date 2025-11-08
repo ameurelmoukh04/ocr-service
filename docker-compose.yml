@@ -1,0 +1,132 @@
+version: "3.9"
+
+services:
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    networks:
+      - app-network
+    depends_on:
+      ollama:
+        condition: service_started
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:1b
+    entrypoint: ["/bin/sh"]
+    command: >
+      -c "
+      echo 'Waiting for Ollama to be ready...';
+      for i in $$(seq 1 30); do
+        if OLLAMA_HOST=http://ollama:11434 ollama list > /dev/null 2>&1; then
+          echo 'Ollama is ready!';
+          break;
+        fi;
+        if [ $$i -eq 30 ]; then
+          echo 'Error: Ollama did not become ready after 30 attempts';
+          exit 1;
+        fi;
+        echo \"Attempt $$i/30: Waiting 5s...\";
+        sleep 5;
+      done;
+      echo 'Checking if model llama3.2:1b is available...';
+      if OLLAMA_HOST=http://ollama:11434 ollama list | grep -q 'llama3.2:1b'; then
+        echo 'Model llama3.2:1b is already available.';
+      else
+        echo 'Model llama3.2:1b not found. Pulling model (this may take a few minutes)...';
+        OLLAMA_HOST=http://ollama:11434 ollama pull llama3.2:1b || {
+          echo 'Error: Failed to pull model. You can pull it manually with:';
+          echo '  docker-compose exec ollama ollama pull llama3.2:1b';
+          exit 1;
+        };
+        echo 'Model llama3.2:1b pulled successfully!';
+      fi;
+      echo 'Available models:';
+      OLLAMA_HOST=http://ollama:11434 ollama list || true;
+      echo 'Ollama initialization complete!'
+      "
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-service
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - app-network
+    # Keep the service running
+    command: serve
+
+  ocr:
+    # build:
+    #   context: ./ocr
+    #   dockerfile: dockerfile
+    image: ameurelmoukh/ocr-service
+    container_name: ocr-service
+    ports:
+      - "8000:8000"
+    networks:
+      - app-network
+    depends_on:
+      - ollama
+    volumes:
+      - paddle-cache:/root/.paddleocr
+      - paddlex-cache:/root/.paddlex
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    working_dir: /app
+
+  comparison:
+    # build:
+    #   context: ./comparison
+    #   dockerfile: dockerfile
+    image: ameurelmoukh/comparison-service
+    container_name: comparison-service
+    ports:
+      - "8001:8000"
+    depends_on:
+      ocr:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      ollama-init:
+        condition: service_started
+    networks:
+      - app-network
+    environment:
+      - OCR_API=http://ocr:8000
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:1b
+    working_dir: /app
+
+  api:
+    # build:
+    #   context: .
+    #   dockerfile: dockerfile
+    image: ameurelmoukh/api-gateway
+    container_name: api-gateway
+    ports:
+      - "8080:8000"
+    depends_on:
+      - ocr
+      - comparison
+      - ollama
+    networks:
+      - app-network
+    environment:
+      - OCR_API=http://ocr:8000
+      - COMPARISON_API=http://comparison:8000
+    working_dir: /app
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  ollama-data:
+  paddle-cache:
+  paddlex-cache:
